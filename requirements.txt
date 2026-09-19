@@ -1,0 +1,6 @@
+yfinance>=0.2.54
+mplfinance>=0.12.10b0
+pandas>=2.0
+numpy
+matplotlib
+requests

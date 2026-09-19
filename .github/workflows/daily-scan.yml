@@ -1,0 +1,41 @@
+name: Nifty 500 daily scan
+
+on:
+  schedule:
+    # 01:00 UTC = 06:30 IST, Monday-Friday (scans the previous session's candle).
+    # GitHub can start scheduled runs 5-30 min late; the email goes out at 08:00 IST.
+    - cron: "0 1 * * 1-5"
+  workflow_dispatch:        # "Run workflow" button for manual/test runs
+    inputs:
+      force:
+        description: "Send even if this candle was already emailed"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write           # to save the cached Nifty 500 list + last-reported date
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run scanner and publish report
+        env:
+          PUBLISH_BASE_URL: https://raw.githubusercontent.com/${{ github.repository }}/main
+          FORCE: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
+        run: python scanner.py
+      - name: Save cache
+        if: always()
+        run: |
+          git config user.name "scan-bot"
+          git config user.email "scan-bot@users.noreply.github.com"
+          git add -A data 2>/dev/null || true
+          git add -A reports 2>/dev/null || true
+          if ! git diff --cached --quiet; then git commit -m "Daily scan report" && git push; fi

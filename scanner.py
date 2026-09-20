@@ -30,6 +30,7 @@ from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -284,6 +285,8 @@ def scan(prices: dict[str, pd.DataFrame], names: dict[str, str]) -> pd.DataFrame
             "Symbol": sym,
             "Company": names.get(sym, sym),
             "Close": round(float(c.iloc[-1]), 2),
+            "High": round(float(d["High"].iloc[-1]), 2),
+            "Low": round(float(d["Low"].iloc[-1]), 2),
             "Chg%": round(float((c.iloc[-1] / c.iloc[-2] - 1) * 100), 2),
             "VolX": round(float(d["Volume"].iloc[-1] / vavg), 1) if vavg else np.nan,
             "RSI": round(float(rsi(c).iloc[-1]), 0),
@@ -334,6 +337,31 @@ def fmt_sigs(sigs) -> str:
     return ", ".join(f'<span style="color:{color[s]}">{n}</span>' for n, s, _ in sigs)
 
 
+ALERT_TO = os.getenv("ALERT_TO", "himanshusardana05@gmail.com")
+
+
+def alert_mailto(sym: str, side: str, close: float, high: float, low: float, short: bool = False) -> str:
+    """mailto: link that opens a pre-filled alert request. The Claude email task reads
+    these emails every morning and checks them against the latest daily close."""
+    default = f"close above {high:.2f}" if side != "bear" else f"close below {low:.2f}"
+    body = (
+        f"Alert me when: {default}\n\n"
+        "Edit the line above if you want, then press Send. Checked on every day's closing data; "
+        "a triggered alert appears at the top of the 8 AM Technical Analysis email.\n\n"
+        "Examples you can write:\n"
+        "  close above 1150  |  close below 1080  |  high above 1200  |  low below 1050\n"
+        "  close crosses above 200 DMA  |  close below 50 DMA  |  RSI below 30  |  RSI above 70\n"
+        "  volume above 2x  |  change above 5%  |  change below -4%  |  52-week high  |  golden cross\n"
+        "  combine with 'and', e.g.  close above 1150 and volume above 1.5x\n\n"
+        f"Reference: {sym} closed {close:.2f} (high {high:.2f}, low {low:.2f}).\n"
+        f"To cancel later, send an email with subject: CANCEL ALERT {sym}"
+    )
+    if short:  # compact version for the email, which must stay small
+        body = (f"Alert me when: {default}\n\n(Edit and send. e.g. close below 1100, RSI below 30, "
+                f"close above 200 DMA, volume above 2x. Cancel: subject CANCEL ALERT {sym})")
+    return f"mailto:{ALERT_TO}?subject={quote('ALERT ' + sym)}&body={quote(body)}"
+
+
 def table_html(df: pd.DataFrame) -> str:
     if df.empty:
         return "<p style='color:#666'>None today.</p>"
@@ -345,13 +373,16 @@ def table_html(df: pd.DataFrame) -> str:
             f"<td align='right'>{r.Close:,.2f}</td>"
             f"<td align='right' style='color:{chg_color}'>{r['Chg%']:+.2f}%</td>"
             f"<td align='right'>{r.VolX}x</td><td align='right'>{r.RSI:.0f}</td>"
-            f"<td>{fmt_sigs(r.Signals)}</td></tr>"
+            f"<td>{fmt_sigs(r.Signals)}</td>"
+            + (f"<td align='center'><a href='{alert_mailto(r.Symbol, r.Side, r.Close, r.High, r.Low, True)}' "
+               f"style='text-decoration:none'>&#128276;</a></td></tr>"
+               if r.Symbol in {c["sym"] for c in CHARTS} else "<td></td></tr>")
         )
     return (
         "<table cellpadding='5' cellspacing='0' border='1' "
         "style='border-collapse:collapse;border-color:#ddd;font-size:13px'>"
         "<tr style='background:#f4f4f4'><th align='left'>Stock</th><th>Close</th><th>Chg</th>"
-        "<th>Vol vs 20d</th><th>RSI</th><th align='left'>Signals</th></tr>"
+        "<th>Vol vs 20d</th><th>RSI</th><th align='left'>Signals</th><th>Alert</th></tr>"
         + "".join(rows) + "</table>"
     )
 
@@ -368,6 +399,60 @@ def neutral_html(df: pd.DataFrame) -> str:
         f"<p style='font-size:13px'><b>{k}</b> ({len(v)}): {', '.join(sorted(v))}</p>"
         for k, v in sorted(groups.items())
     )
+
+
+CHARTS: list[dict] = []   # charts drawn this run, in email order
+PRICES: dict = {}         # symbol -> DataFrame, set in main()
+
+
+def stacked_page_md(day_label: str) -> str:
+    """README.md for reports/<date>/: every chart stacked, each with an alert button."""
+    out = [f"# Technical Analysis Alert on Nifty 500 - charts for {day_label}", "",
+           "Scroll through all charts. Tap **Set alert** under any chart to get an email "
+           "alert in the 8 AM report when your price/condition triggers on the daily close.", ""]
+    for i, c in enumerate(CHARTS, 1):
+        tag = "BULLISH" if c["side"] == "bull" else "BEARISH"
+        tv = f"https://www.tradingview.com/chart/?symbol=NSE:{quote(c['sym'])}"
+        mail = alert_mailto(c["sym"], c["side"], c["close"], c["high"], c["low"])
+        out += [
+            f"## {i}. {c['sym']} - {tag}",
+            f"**{c['close']:,.2f}** ({c['chg']:+.2f}%) | vol {c['volx']}x | RSI {c['rsi']:.0f} | "
+            f"H {c['high']:,.2f} / L {c['low']:,.2f}  ",
+            f"{c['signals']}",
+            "",
+            f"![{c['sym']}]({c['cid']}.png)",
+            "",
+            f"[🔔 Set alert on {c['sym']}]({mail}) &nbsp;|&nbsp; [📈 Live chart (TradingView)]({tv})",
+            "", "---", "",
+        ]
+    return "\n".join(out)
+
+
+def levels_json(day: str) -> dict:
+    """Latest daily levels for every scanned stock, used to check alerts each morning."""
+    out = {}
+    for sym, d in PRICES.items():
+        try:
+            c, h, l, v = d["Close"], d["High"], d["Low"], d["Volume"]
+            s20, s50, s200 = (c.rolling(n).mean() for n in (20, 50, 200))
+            r = rsi(c)
+            look = min(250, len(c) - 1)
+            vavg = v.iloc[-21:-1].mean()
+            f = lambda x: None if pd.isna(x) else round(float(x), 2)  # noqa: E731
+            out[sym] = {
+                "date": str(pd.Timestamp(d.index[-1]).date()),
+                "open": f(d["Open"].iloc[-1]), "high": f(h.iloc[-1]), "low": f(l.iloc[-1]),
+                "close": f(c.iloc[-1]), "prev_close": f(c.iloc[-2]),
+                "change_pct": f((c.iloc[-1] / c.iloc[-2] - 1) * 100),
+                "volume_x": f(v.iloc[-1] / vavg) if vavg else None,
+                "rsi": f(r.iloc[-1]), "prev_rsi": f(r.iloc[-2]),
+                "sma20": f(s20.iloc[-1]), "sma50": f(s50.iloc[-1]), "sma200": f(s200.iloc[-1]),
+                "prev_sma20": f(s20.iloc[-2]), "prev_sma50": f(s50.iloc[-2]), "prev_sma200": f(s200.iloc[-2]),
+                "prior_52w_high": f(h.iloc[-look - 1:-1].max()), "prior_52w_low": f(l.iloc[-look - 1:-1].min()),
+            }
+        except Exception as e:
+            print(f"  levels failed {sym}: {e}")
+    return {"as_of": day, "stocks": out}
 
 
 def build_email(results: pd.DataFrame, prices, candle_date: dt.date, universe_n: int):
@@ -388,6 +473,10 @@ def build_email(results: pd.DataFrame, prices, candle_date: dt.date, universe_n:
                 continue
             cid = f"{side}_{r.Symbol}".replace("&", "and").replace("-", "_")
             images.append((cid, png))
+            CHARTS.append({"sym": r.Symbol, "company": r.Company, "side": side, "cid": cid,
+                           "close": r.Close, "chg": r["Chg%"], "volx": r.VolX, "rsi": r.RSI,
+                           "high": r.High, "low": r.Low,
+                           "signals": ", ".join(n for n, _, _ in r.Signals)})
             chart_blocks[side].append(
                 f"<div style='margin:10px 0'><img src='cid:{cid}' width='720' "
                 f"style='max-width:100%;border:1px solid #eee' alt='{r.Symbol}'></div>"
@@ -433,8 +522,16 @@ def publish_report(subject: str, html: str, images: list[tuple[str, bytes]]):
         (folder / f"{cid}.png").write_bytes(png)
         page = page.replace(f"cid:{cid}", base + f"{cid}.png")
     (folder / "email.html").write_text(page)
-    (rep_root / "latest.json").write_text(json.dumps(
-        {"run_date": day, "subject": subject, "html_url": base + "email.html"}))
+    candle_day = (next(iter(PRICES.values())).index[-1].strftime("%a %d %b %Y") if PRICES else day)
+    (folder / "README.md").write_text(stacked_page_md(candle_day))
+    lv = levels_json(day)
+    (rep_root / "levels.json").write_text(json.dumps(lv, separators=(",", ":")))
+    repo = os.getenv("GITHUB_REPOSITORY", "HimanshuSardana05/nifty500-scanner")
+    (rep_root / "latest.json").write_text(json.dumps({
+        "run_date": day, "subject": subject, "html_url": base + "email.html",
+        "charts_url": f"https://github.com/{repo}/blob/main/reports/{day}/README.md",
+        "levels_url": os.environ["PUBLISH_BASE_URL"].rstrip("/") + "/reports/levels.json",
+        "levels_as_of": next(iter(lv["stocks"].values()))["date"] if lv["stocks"] else None}))
     # keep the repo small: only the last 10 report folders
     olds = sorted(p for p in rep_root.iterdir() if p.is_dir())[:-10]
     for p in olds:
@@ -490,6 +587,7 @@ def main():
         print(f"Candle {candle_date} already reported (market holiday?) - skipping email.")
         return
 
+    PRICES.update(prices)
     results = scan(prices, names)
     subject, html, images = build_email(results, prices, candle_date, len(uni))
     send_email(subject, html, images)

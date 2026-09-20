@@ -422,7 +422,7 @@ def stacked_page_md(day_label: str) -> str:
             "",
             f"![{c['sym']}]({c['cid']}.png)",
             "",
-            f"[🔔 Set alert on {c['sym']}]({mail}) &nbsp;|&nbsp; [📈 Live chart (TradingView)]({tv})",
+            f"[🔔 Set alert on {c['sym']}](https://claude.ai/artifact/Ewc5hHTPX6WkU1nVcDNQzq?s={quote(c['sym'])}&c={quote(('close above %.2f' % c['high']) if c['side'] == 'bull' else ('close below %.2f' % c['low']))}) &nbsp;|&nbsp; [📈 Live chart (TradingView)]({tv}) &nbsp;|&nbsp; [alert by email]({mail})",
             "", "---", "",
         ]
     return "\n".join(out)

@@ -588,6 +588,20 @@ def main():
 
     if STATE_FILE.exists() and STATE_FILE.read_text().strip() == str(candle_date) and os.getenv("FORCE") != "1":
         print(f"Candle {candle_date} already reported (market holiday?) - skipping email.")
+        if os.getenv("PUBLISH_BASE_URL"):
+            import json
+            latest_path = ROOT / "reports" / "latest.json"
+            prev = {}
+            if latest_path.exists():
+                try:
+                    prev = json.loads(latest_path.read_text())
+                except Exception:
+                    prev = {}
+            prev["run_date"] = dt.datetime.now(IST).strftime("%Y-%m-%d")
+            prev["skipped"] = True
+            prev["skip_reason"] = f"candle of {candle_date} already reported - no new trading session since (market holiday or data not yet updated)"
+            latest_path.parent.mkdir(parents=True, exist_ok=True)
+            latest_path.write_text(json.dumps(prev))
         return
 
     PRICES.update(prices)

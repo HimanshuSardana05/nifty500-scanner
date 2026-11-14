@@ -42,6 +42,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import mplfinance as mpf  # noqa: E402
 
+from levels import LevelIndicator  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent
 UNIVERSE_CACHE = ROOT / "data" / "nifty500.csv"
 STATE_FILE = ROOT / "data" / "last_reported.txt"
@@ -49,6 +51,14 @@ OUT_DIR = ROOT / "out"
 IST = ZoneInfo("Asia/Kolkata")
 NSE_LIST_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 MAX_CHARTS = int(os.getenv("MAX_CHARTS_PER_SIDE", "15"))
+
+# Support/resistance zones + swing levels, tuned for daily candles (the class defaults
+# are calibrated for 5-minute bars). One daily bar = one "session" here.
+LEVELS = LevelIndicator()
+LEVELS.ZONE_SESSIONS = 150           # ~7 months of daily bars searched for zone pivots
+LEVELS.ZONE_PIVOT_BARS = 10          # ~2 trading weeks either side to count as a pivot
+LEVELS.ZONE_SUPPRESSION_BARS = 10
+LEVELS.ZONE_IN_PLAY_DAILY_ATR = 1.5  # a bit wider than default so charts aren't often empty
 
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +131,46 @@ def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     dn = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
     rs = up / dn.replace(0, np.nan)
     return 100 - 100 / (1 + rs)
+
+
+# --------------------------------------------------------------------------- #
+# Support/resistance zones + swing levels
+# --------------------------------------------------------------------------- #
+def to_level_candles(d: pd.DataFrame) -> pd.DataFrame:
+    """Adapt this scanner's daily OHLCV frame (DatetimeIndex) to what LevelIndicator
+    expects: one row per session, since a daily bar IS its own session here."""
+    idx = d.index
+    return pd.DataFrame({
+        "time": idx,
+        "session": idx.date,
+        "high": d["High"].to_numpy(dtype=float),
+        "low": d["Low"].to_numpy(dtype=float),
+        "close": d["Close"].to_numpy(dtype=float),
+        "volume": d["Volume"].to_numpy(dtype=float),
+    })
+
+
+def stock_levels(d: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+    """Support/resistance zones, swing levels, and which of them today's candle
+    (its high/low range) touched - a 'test', regardless of where it closed."""
+    candles = to_level_candles(d)
+    zones_df = LEVELS.zones(candles)
+    swings_df = LEVELS.swingLevels(candles)
+    today_high, today_low = float(d["High"].iloc[-1]), float(d["Low"].iloc[-1])
+    tested: list[dict] = []
+    for _, z in zones_df.iterrows():
+        if today_low <= z.high and today_high >= z.low:
+            tested.append({
+                "kind": "zone", "side": z.side, "score": float(z.score),
+                "low": float(z.low), "high": float(z.high), "touches": int(z.touches),
+            })
+    for _, s in swings_df.iterrows():
+        if today_low <= s.price <= today_high:
+            tested.append({
+                "kind": "swing", "side": s.side, "price": float(s.price),
+                "confirmed": bool(s.confirmed), "broken": bool(s.broken),
+            })
+    return zones_df, swings_df, tested
 
 
 # --------------------------------------------------------------------------- #
@@ -267,6 +317,10 @@ def technical_signals(d: pd.DataFrame) -> list[tuple[str, str, int]]:
     return sig
 
 
+ZONES: dict[str, pd.DataFrame] = {}   # symbol -> in-play support/resistance zones, set in scan()
+SWINGS: dict[str, pd.DataFrame] = {}  # symbol -> nearby swing levels, set in scan()
+
+
 def scan(prices: dict[str, pd.DataFrame], names: dict[str, str]) -> pd.DataFrame:
     rows = []
     for sym, d in prices.items():
@@ -275,7 +329,13 @@ def scan(prices: dict[str, pd.DataFrame], names: dict[str, str]) -> pd.DataFrame
         except Exception as e:
             print(f"  {sym}: scan error {e}")
             continue
-        if not sigs:
+        try:
+            zones_df, swings_df, tested = stock_levels(d)
+            ZONES[sym], SWINGS[sym] = zones_df, swings_df
+        except Exception as e:
+            print(f"  {sym}: levels error {e}")
+            zones_df, swings_df, tested = pd.DataFrame(), pd.DataFrame(), []
+        if not sigs and not tested:
             continue
         bull = sum(w for _, s, w in sigs if s == "bull")
         bear = sum(w for _, s, w in sigs if s == "bear")
@@ -294,6 +354,7 @@ def scan(prices: dict[str, pd.DataFrame], names: dict[str, str]) -> pd.DataFrame
             "Side": "bull" if bull > bear else "bear" if bear > bull else "neutral",
             "Score": max(bull, bear),
             "Signals": sigs,
+            "LevelTests": tested,
         })
     return pd.DataFrame(rows)
 
@@ -307,7 +368,8 @@ STYLE = mpf.make_mpf_style(
 )
 
 
-def make_chart(sym: str, d: pd.DataFrame, title: str) -> bytes:
+def make_chart(sym: str, d: pd.DataFrame, title: str,
+                zones_df: pd.DataFrame | None = None, swings_df: pd.DataFrame | None = None) -> bytes:
     full = d.copy()
     for n in (20, 50, 200):
         full[f"SMA{n}"] = full["Close"].rolling(n).mean()
@@ -323,7 +385,30 @@ def make_chart(sym: str, d: pd.DataFrame, title: str) -> bytes:
         figsize=(9, 5), returnfig=True,
         vlines=dict(vlines=[plot.index[-1]], colors="#bbbbbb", linewidths=6, alpha=0.25),
     )
-    axes[0].set_title(title, loc="left", fontsize=10, fontweight="bold")
+    ax = axes[0]
+    # mplfinance's "yahoo" style puts the price axis + its tick labels on the RIGHT, so
+    # put our own zone/swing price labels on the LEFT edge (x in axes-fraction, y in data
+    # coords) instead of colliding with them.
+    label = ax.get_yaxis_transform()
+    extra_y: list[float] = []
+    if zones_df is not None and not zones_df.empty:
+        for _, z in zones_df.iterrows():
+            ax.axhspan(z.low, z.high, color="#1a73e8", alpha=0.08 + 0.18 * float(z.score), zorder=0)
+            ax.text(-0.01, z.mid, f"{z.mid:,.0f} ", transform=label, fontsize=7, color="#1a73e8",
+                    va="center", ha="right", clip_on=False)
+            extra_y += [float(z.low), float(z.high)]
+    if swings_df is not None and not swings_df.empty:
+        for _, s in swings_df.iterrows():
+            color = "#0a7d32" if s.side == "low" else "#b3261e"
+            ax.axhline(s.price, color=color, linewidth=0.9, linestyle="--" if s.broken else "-",
+                       alpha=0.75, zorder=0)
+            ax.text(-0.01, s.price, f"{s.price:,.0f} ", transform=label, fontsize=7, color=color,
+                    va="center", ha="right", clip_on=False)
+            extra_y.append(float(s.price))
+    if extra_y:
+        ylo, yhi = ax.get_ylim()
+        ax.set_ylim(min(ylo, *extra_y) * 0.998, max(yhi, *extra_y) * 1.002)
+    ax.set_title(title, loc="left", fontsize=10, fontweight="bold")
     fig.savefig(buf, dpi=80, format="png", bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
     return buf.getvalue()
@@ -337,7 +422,7 @@ def fmt_sigs(sigs) -> str:
     return ", ".join(f'<span style="color:{color[s]}">{n}</span>' for n, s, _ in sigs)
 
 
-ALERT_TO = os.getenv("ALERT_TO", "himanshusardana05@gmail.com")
+ALERT_TO = os.getenv("ALERT_TO", "REPLACE_WITH_YOUR_EMAIL")
 
 
 def alert_mailto(sym: str, side: str, close: float, high: float, low: float, short: bool = False) -> str:
@@ -387,6 +472,45 @@ def table_html(df: pd.DataFrame) -> str:
     )
 
 
+def levels_tested_html(results: pd.DataFrame, chart_cid: dict[str, str]) -> str:
+    """Every stock whose high/low range today traded into a support/resistance zone
+    or through a swing level - the 'specific daily alert' for tested levels."""
+    if results.empty or "LevelTests" not in results:
+        return "<p style='color:#666'>None today.</p>"
+    rows = []
+    for _, r in results.iterrows():
+        for t in r.LevelTests:
+            if r.Symbol in chart_cid:
+                chart_link, chart_label = f"cid:{chart_cid[r.Symbol]}", "chart"
+            else:
+                chart_link = f"https://www.tradingview.com/chart/?symbol=NSE:{quote(r.Symbol)}"
+                chart_label = "TradingView"
+            if t["kind"] == "zone":
+                label = {"above": "Resistance zone", "below": "Support zone"}.get(t["side"], "Zone (price inside)")
+                level_txt = f"{t['low']:,.2f}&ndash;{t['high']:,.2f}"
+                extra = f"score {t['score']:.2f} &middot; {t['touches']} touches"
+            else:
+                label = "Swing high (resistance)" if t["side"] == "high" else "Swing low (support)"
+                level_txt = f"{t['price']:,.2f}"
+                extra = ("confirmed" if t["confirmed"] else "unconfirmed") + (", broken" if t["broken"] else "")
+            rows.append(
+                f"<tr><td><b>{r.Symbol}</b> <a href='{chart_link}' style='font-size:11px'>[{chart_label}]</a>"
+                f"<br><span style='color:#888;font-size:11px'>{r.Company}</span></td>"
+                f"<td>{label}</td><td align='right'>{level_txt}</td>"
+                f"<td align='right'>{r.Close:,.2f}</td>"
+                f"<td style='font-size:12px;color:#666'>{extra}</td></tr>"
+            )
+    if not rows:
+        return "<p style='color:#666'>None today.</p>"
+    return (
+        "<table cellpadding='5' cellspacing='0' border='1' "
+        "style='border-collapse:collapse;border-color:#ddd;font-size:13px;width:100%'>"
+        "<tr style='background:#f4f4f4'><th align='left'>Stock</th><th align='left'>Level</th>"
+        "<th>Price</th><th>Close</th><th align='left'>Detail</th></tr>"
+        + "".join(rows) + "</table>"
+    )
+
+
 def neutral_html(df: pd.DataFrame) -> str:
     """Inside bars / NR7 / doji are common, so list them compactly by setup."""
     if df.empty:
@@ -411,7 +535,7 @@ def stacked_page_md(day_label: str) -> str:
            "Scroll through all charts. Tap **Set alert** under any chart to get an email "
            "alert in the 8 AM report when your price/condition triggers on the daily close.", ""]
     for i, c in enumerate(CHARTS, 1):
-        tag = "BULLISH" if c["side"] == "bull" else "BEARISH"
+        tag = {"bull": "BULLISH", "bear": "BEARISH"}.get(c["side"], "LEVEL TEST")
         tv = f"https://www.tradingview.com/chart/?symbol=NSE:{quote(c['sym'])}"
         mail = alert_mailto(c["sym"], c["side"], c["close"], c["high"], c["low"])
         out += [
@@ -462,17 +586,19 @@ def build_email(results: pd.DataFrame, prices, candle_date: dt.date, universe_n:
 
     images: list[tuple[str, bytes]] = []
     chart_blocks = {"bull": [], "bear": []}
+    chart_cid: dict[str, str] = {}
     for side, df in (("bull", bull), ("bear", bear)):
         for _, r in df.head(MAX_CHARTS).iterrows():
             names = ", ".join(n for n, _, _ in r.Signals)
             title = f"{r.Symbol}  {r.Close:,.2f} ({r['Chg%']:+.2f}%)\n{names}"
             try:
-                png = make_chart(r.Symbol, prices[r.Symbol], title)
+                png = make_chart(r.Symbol, prices[r.Symbol], title, ZONES.get(r.Symbol), SWINGS.get(r.Symbol))
             except Exception as e:
                 print(f"  chart failed {r.Symbol}: {e}")
                 continue
             cid = f"{side}_{r.Symbol}".replace("&", "and").replace("-", "_")
             images.append((cid, png))
+            chart_cid[r.Symbol] = cid
             CHARTS.append({"sym": r.Symbol, "company": r.Company, "side": side, "cid": cid,
                            "close": r.Close, "chg": r["Chg%"], "volx": r.VolX, "rsi": r.RSI,
                            "high": r.High, "low": r.Low,
@@ -482,14 +608,41 @@ def build_email(results: pd.DataFrame, prices, candle_date: dt.date, universe_n:
                 f"style='max-width:100%;border:1px solid #eee' alt='{r.Symbol}'></div>"
             )
 
+    # A stock can test a level with no candlestick/technical signal (it won't be in the
+    # bull/bear chart lists above) - still give it an annotated chart for the alert below.
+    if "LevelTests" in results:
+        for _, r in results[results["LevelTests"].map(bool)].iterrows():
+            if r.Symbol in chart_cid:
+                continue
+            title = f"{r.Symbol}  {r.Close:,.2f} ({r['Chg%']:+.2f}%)\nLevel test"
+            try:
+                png = make_chart(r.Symbol, prices[r.Symbol], title, ZONES.get(r.Symbol), SWINGS.get(r.Symbol))
+            except Exception as e:
+                print(f"  chart failed {r.Symbol}: {e}")
+                continue
+            cid = f"level_{r.Symbol}".replace("&", "and").replace("-", "_")
+            images.append((cid, png))
+            chart_cid[r.Symbol] = cid
+            CHARTS.append({"sym": r.Symbol, "company": r.Company, "side": "neutral", "cid": cid,
+                           "close": r.Close, "chg": r["Chg%"], "volx": r.VolX, "rsi": r.RSI,
+                           "high": r.High, "low": r.Low, "signals": "Level test"})
+
     day = candle_date.strftime("%a %d %b %Y")
+    test_count = int(results["LevelTests"].map(len).sum()) if "LevelTests" in results else 0
     html = f"""
 <div style="font-family:Arial,Helvetica,sans-serif;color:#222;max-width:900px">
 <h2 style="margin-bottom:4px">Nifty 500 daily scan - candle of {day}</h2>
 <p style="color:#666;margin-top:0">{len(prices)} of {universe_n} stocks scanned &middot;
 <b style="color:#0a7d32">{len(bull)} bullish</b> &middot;
-<b style="color:#b3261e">{len(bear)} bearish</b> &middot; {len(neutral)} neutral setups.
-Ranked by signal strength, then volume. Charts: last ~6 months, 20/50/200 SMA (blue/orange/grey).</p>
+<b style="color:#b3261e">{len(bear)} bearish</b> &middot; {len(neutral)} neutral setups &middot;
+<b style="color:#1a73e8">{test_count} level test(s)</b>.
+Ranked by signal strength, then volume. Charts: last ~6 months, 20/50/200 SMA (blue/orange/grey),
+support/resistance zones (blue bands) and swing levels (green = support, red = resistance, dashed = broken).</p>
+
+<div style="border:2px solid #1a73e8;border-radius:8px;padding:10px 14px;margin:12px 0">
+<h3 style="color:#1a73e8;margin:4px 0">&#127919; Levels tested today ({test_count})</h3>
+{levels_tested_html(results, chart_cid)}
+</div>
 
 <h3 style="color:#0a7d32">Bullish</h3>{table_html(bull)}
 <h3 style="color:#b3261e">Bearish</h3>{table_html(bear)}

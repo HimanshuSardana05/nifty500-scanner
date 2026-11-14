@@ -30,6 +30,7 @@ jobs:
         env:
           PUBLISH_BASE_URL: https://raw.githubusercontent.com/${{ github.repository }}/main
           FORCE: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
         run: python scanner.py
       - name: Save cache
         if: always()
